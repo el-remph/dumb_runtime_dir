@@ -5,9 +5,6 @@
  * base directory spec. Flaunts the spec and never removes it, even after
  * last logout. This keeps things simple and predictable.
  *
- * The user is responsible for ensuring that the RUNTIME_DIR_PARENT directory,
- * (/run/user by default) exists and is only writable by root.
- *
  * Copyright 2021 Isaac Freund
  *
  * Permission to use, copy, modify, and/or distribute this software for any
@@ -27,10 +24,22 @@
 #include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <security/pam_modules.h>
+
+static int mkdir_ensureperms(const char *path, mode_t mode, uid_t uid, gid_t gid) {
+	if (mkdir(path, mode) < 0) {
+		/* It's ok if the directory already exists, in that case we just
+		 * ensure the mode is correct before we chown(). */
+		if (!(errno == EEXIST && chmod(path, mode) == 0)) {
+			return -1;
+		}
+	}
+	return chown(path, uid, gid);
+}
 
 int pam_sm_open_session(pam_handle_t *pamh, int flags,
 		int argc, const char **argv) {
@@ -60,18 +69,13 @@ int pam_sm_open_session(pam_handle_t *pamh, int flags,
 	assert(ret >= 0 && (size_t)ret < sizeof(buffer));
 	const char *path = buffer + sizeof("XDG_RUNTIME_DIR=") - 1;
 
-	if (mkdir(path, 0700) < 0) {
-		/* It's ok if the directory already exists, in that case we just
-		 * ensure the mode is correct before we chown(). */
-		if (errno != EEXIST) {
-			return PAM_SESSION_ERR;
-		}
-		if (chmod(path, 0700) < 0) {
-			return PAM_SESSION_ERR;
-		}
-	}
-
-	if (chown(path, pw->pw_uid, pw->pw_gid) < 0) {
+	const mode_t oldmask = umask(S_IWGRP | S_IWOTH);
+	/* see kernel source include/linux/uidgid.h: uid and gid 0 are
+	 * guaranteed to be root */
+	ret = mkdir_ensureperms(RUNTIME_DIR_PARENT, 0755, 0, 0) == 0
+		&& mkdir_ensureperms(path, 0700, pw->pw_uid, pw->pw_gid) == 0;
+	umask(oldmask);
+	if (!ret) {
 		return PAM_SESSION_ERR;
 	}
 
